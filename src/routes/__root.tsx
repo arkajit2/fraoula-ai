@@ -94,8 +94,8 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:title", content: "Fraoula AI - Fast, focused AI chat" },
       { name: "twitter:description", content: "A minimal AI chat workspace with multiple models and prepaid credits." },
-      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/eb1b16fb-ce30-43db-9c75-ee5ee1d70a89/id-preview-cdc6631d--77565801-b53b-4721-9cde-70a07e3f08a0.lovable.app-1785425305456.png" },
-      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/eb1b16fb-ce30-43db-9c75-ee5ee1d70a89/id-preview-cdc6631d--77565801-b53b-4721-9cde-70a07e3f08a0.lovable.app-1785425305456.png" },
+      { property: "og:image", content: "https://fraoula-ai.arkajitdas081.workers.dev/fraoula-logo.jpg" },
+      { name: "twitter:image", content: "https://fraoula-ai.arkajitdas081.workers.dev/fraoula-logo.jpg" },
     ],
     links: [
       {

@@ -23,11 +23,11 @@ id = "464af04bbee74045a73ba57bf43d2ad6"
 # binding = "FRAOULA_IMAGES"
 # bucket_name = "fraoula-images"
 
-# ─── Public env vars (non-secret) ────────────────────────────────────────────
+# ─── Public env vars ─────────────────────────────────────────────────────────
 [vars]
 APP_ENV = "production"
 APP_URL = "https://fraoula-ai.arkajitdas081.workers.dev"
-# JWT_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET → set via `wrangler secret put`
+# STRIPE_WEBHOOK_SECRET, STRIPE_SECRET_KEY, JWT_SECRET are set securely via Cloudflare Dashboard / Secrets
 
 # ─── Production environment ──────────────────────────────────────────────────
 [env.production]

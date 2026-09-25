@@ -3,6 +3,11 @@ const SUGGESTIONS = ["Ask anything", "Research", "Write", "Explain"];
 export function WelcomeScreen({ onPick }: { onPick: (prompt: string) => void }) {
   return (
     <div className="flex min-h-[45vh] flex-col items-center justify-center text-center">
+      <img
+        src="/fraoula-logo.jpg"
+        alt="Fraoula AI"
+        className="mb-6 h-16 w-16 rounded-2xl shadow-md object-cover ring-2 ring-primary/20"
+      />
       <h1 className="font-display text-3xl tracking-tight text-foreground sm:text-4xl">
         What do you want to know?
       </h1>

@@ -1,11 +1,8 @@
 {
   "version": 1,
-  "asset_id": "9453ec44-326a-4e8c-a73a-dd7aa0701aae",
-  "project_id": "8be95a70-3031-4f90-a411-d753b76d4fa2",
-  "url": "/__l5e/assets-v1/9453ec44-326a-4e8c-a73a-dd7aa0701aae/fraoula-logo.jpg",
-  "r2_key": "a/v1/8be95a70-3031-4f90-a411-d753b76d4fa2/9453ec44-326a-4e8c-a73a-dd7aa0701aae/fraoula-logo.jpg",
+  "asset_id": "fraoula-brand-logo",
+  "project_id": "fraoula-ai",
+  "url": "/fraoula-logo.jpg",
   "original_filename": "fraoula-logo.jpg",
-  "size": 173796,
-  "content_type": "image/jpeg",
-  "created_at": "2026-07-31T15:09:47Z"
+  "content_type": "image/jpeg"
 }

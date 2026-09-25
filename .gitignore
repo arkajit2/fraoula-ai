@@ -51,3 +51,7 @@ env/
 .env.local
 .env.*.local
 .env.production
+
+# Scratch scripts
+scratch/
+encrypt_secret.*
