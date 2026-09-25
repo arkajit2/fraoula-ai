@@ -1,0 +1,38 @@
+name = "fraoula-ai"
+main = "src/worker-entry.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Build the TanStack Start app, then serve it via a Worker
+[build]
+command = "npm run build"
+watch_dir = "src"
+
+# Static assets served from Cloudflare Pages / R2
+[[assets]]
+directory = ".output/public"
+
+# Environment variables (set the real values via `wrangler secret put`)
+[vars]
+SUPABASE_PROJECT_ID = ""
+VITE_SUPABASE_PROJECT_ID = ""
+
+# KV namespace for session / rate-limit state (created with `wrangler kv:namespace create fraoula-cache`)
+[[kv_namespaces]]
+binding = "FRAOULA_CACHE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# R2 bucket for image storage
+[[r2_buckets]]
+binding = "FRAOULA_IMAGES"
+bucket_name = "fraoula-images"
+
+# Tail workers for observability (optional)
+# [[tail_consumers]]
+# service = "fraoula-tail"
+
+[env.production]
+name = "fraoula-ai-production"
+
+[env.staging]
+name = "fraoula-ai-staging"
