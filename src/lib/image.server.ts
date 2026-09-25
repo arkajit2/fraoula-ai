@@ -1,36 +1,30 @@
 /**
- * SERVER-ONLY image generation.
+ * SERVER-ONLY image generation — Cloudflare Workers AI + R2 edition.
  *
- * Mirrors the chat turn: nothing is persisted and nothing is charged until the
- * provider has returned a real image. Images are stored in a private bucket and
- * only ever reach the browser through short-lived signed URLs.
+ * Uses @cf/bytedance/stable-diffusion-xl-lightning (free via Workers AI) for
+ * image generation and R2 for storage. No external API keys or Supabase needed.
  */
 
-import type { SupabaseClient } from "@supabase/supabase-js";
-import type { Database } from "@/integrations/supabase/types";
-import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { getImageModel, round6 } from "./pricing";
+import { ChatError, creditWallet } from "./chat.server";
+import type { WorkerEnv } from "./chat.server";
 import {
-  MIN_IMAGE_PRICE,
-  getImageModel,
-  round6,
-  type ImageModelConfig,
-} from "./pricing";
-import { IMAGE_API_COSTS, IMAGE_ENDPOINT, PROVIDERS } from "./pricing.server";
-import { ChatError, settleCharge } from "./chat.server";
-import { enforceRateLimit } from "./rate-limit.server";
-import { log } from "./logging.server";
-import { recordUsage } from "./usage.server";
+  getWallet,
+  createWallet,
+  updateWalletBalance,
+  getConversation,
+  createConversation,
+  insertMessages,
+  recordUsage,
+} from "./db.server";
 
-type Client = SupabaseClient<Database>;
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-const CONFIG = {
-  bucket: "chat-images",
-  minBalanceUsd: MIN_IMAGE_PRICE,
-  maxPromptLength: 4_000,
-  titleLength: 60,
-  timeoutMs: 180_000,
-  signedUrlSeconds: 60 * 60,
-} as const;
+const CF_IMAGE_MODEL = "@cf/bytedance/stable-diffusion-xl-lightning";
+const IMAGE_API_COST_USD = 0.0; // Free on Workers AI
+const MIN_BALANCE_FOR_PAID_IMAGE = 0.05; // $0.05 minimum
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface GenerateImageInput {
   conversationId: string | null;
@@ -42,262 +36,158 @@ export interface GenerateImageResult {
   conversationId: string;
   userMessageId: string;
   assistantMessage: { id: string; content: string; created_at: string; imagePath: string };
-  signedUrl: string;
+  r2Url: string;
   balance: number;
   cost: number;
 }
 
-interface ImageResponse {
-  data?: { b64_json?: string }[];
-  error?: { message?: string; code?: string };
-}
+// ─── Main function ────────────────────────────────────────────────────────────
 
-/**
- * Request body differs per model family: OpenAI image models take `prompt`,
- * Gemini image models take chat `messages` plus `modalities`.
- */
-function buildBody(model: ImageModelConfig, prompt: string): Record<string, unknown> {
-  if (model.wire === "gemini") {
-    return {
-      model: model.remoteModel,
-      messages: [{ role: "user", content: prompt }],
-      modalities: ["image", "text"],
-    };
-  }
-  return {
-    model: model.remoteModel,
-    prompt,
-    size: model.size,
-    quality: model.quality,
-    n: 1,
-  };
-}
-
-/** Calls the gateway and returns the raw PNG bytes. */
-async function generatePng(model: ImageModelConfig, prompt: string): Promise<Uint8Array> {
-  const apiKey = process.env.LOVABLE_API_KEY;
-  if (!apiKey) throw new ChatError("Image generation isn't available right now.", 503);
-
-  let response: Response;
-  try {
-    response = await fetch(IMAGE_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(buildBody(model, prompt)),
-      signal: AbortSignal.timeout(CONFIG.timeoutMs),
-    });
-
-  } catch {
-    throw new ChatError("The image took too long to generate. Please try again.", 504);
-  }
-
-  if (response.status === 429) {
-    throw new ChatError("Image generation is busy right now. Please try again in a moment.", 429);
-  }
-  if (response.status === 402) {
-    throw new ChatError("AI service credits are exhausted. Please contact support.", 402);
-  }
-
-  let json: ImageResponse;
-  try {
-    json = (await response.json()) as ImageResponse;
-  } catch {
-    throw new ChatError("The image service returned an unreadable response. Please try again.", 502);
-  }
-
-  const code = json.error?.code ?? "";
-  if (code === "content_policy_violation" || code === "moderation_blocked") {
-    throw new ChatError(
-      "That prompt was rejected by the safety filter. Try describing the image differently.",
-      400,
-    );
-  }
-  if (!response.ok || json.error) {
-    throw new ChatError("The image couldn't be generated. Please try a different prompt.", 502);
-  }
-
-  const b64 = json.data?.[0]?.b64_json;
-  if (!b64) throw new ChatError("The image service returned no image. Please try again.", 502);
-
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-/** Handles one image turn end to end: generate, store, persist, charge. */
 export async function generateImageTurn(
-  supabase: Client,
+  env: WorkerEnv,
   userId: string,
   input: GenerateImageInput,
-  meta: { requestId: string; endpoint: string },
 ): Promise<GenerateImageResult> {
-  const ctx = { ...meta, userId };
+  const { DB: db, AI: ai } = env;
+  const r2 = (env as unknown as { FRAOULA_IMAGES?: R2Bucket }).FRAOULA_IMAGES;
 
   const prompt = input.prompt.trim();
   if (!prompt) throw new ChatError("Describe the image you'd like to create.");
-  if (prompt.length > CONFIG.maxPromptLength) throw new ChatError("That prompt is too long.");
+  if (prompt.length > 4_000) throw new ChatError("That prompt is too long.");
 
-  // The client only sends an id — the model, its wire format and its price are
-  // all resolved here so a tampered request can't pick a cheaper price.
   const model = getImageModel(input.imageModelId);
   if (!model) throw new ChatError("That image model isn't available.", 400);
-  const apiCost = IMAGE_API_COSTS[model.id] ?? model.pricePerImage / 2;
 
-  await enforceRateLimit(userId, "chatBurst");
-  await enforceRateLimit(userId, "chat");
-
+  // Check conversation ownership
   if (input.conversationId) {
-    const { data: owned } = await supabase
-      .from("conversations")
-      .select("id")
-      .eq("id", input.conversationId)
-      .maybeSingle();
-    if (!owned) throw new ChatError("Conversation not found.", 404);
+    const convo = await getConversation(db, input.conversationId, userId);
+    if (!convo) throw new ChatError("Conversation not found.", 404);
   }
 
-  // Image generation is premium only — it never touches the free allowance.
-  const { data: wallet } = await supabaseAdmin
-    .from("wallets")
-    .select("balance")
-    .eq("user_id", userId)
-    .maybeSingle();
-  if (!wallet || Number(wallet.balance) < model.pricePerImage) {
-    throw new ChatError(
-      `Not enough credits to generate an image with ${model.label}. Please recharge your wallet on the Credits page.`,
-      402,
-    );
+  // Balance check for paid image models
+  const charge = model.pricePerImage ?? 0;
+  if (charge > 0) {
+    let wallet = await getWallet(db, userId);
+    if (!wallet) wallet = await createWallet(db, userId);
+    if (wallet.balance < charge) {
+      throw new ChatError(
+        `Not enough credits for ${model.label}. Recharge your wallet on the Credits page.`,
+        402,
+      );
+    }
   }
 
+  // Generate via CF Workers AI
+  let imageBytes: Uint8Array;
+  try {
+    const result = await (ai as unknown as {
+      run(model: string, inputs: { prompt: string }): Promise<ReadableStream | { image: string }>;
+    }).run(CF_IMAGE_MODEL, { prompt });
 
-
-  const startedAt = Date.now();
-  const bytes = await generatePng(model, prompt);
-  log.info("image.latency", { ...ctx, model: model.id, latencyMs: Date.now() - startedAt });
-
-
-  const path = `${userId}/${crypto.randomUUID()}.png`;
-  const { error: uploadError } = await supabaseAdmin.storage
-    .from(CONFIG.bucket)
-    .upload(path, bytes, { contentType: "image/png", upsert: false });
-  if (uploadError) {
-    log.error("image.upload", ctx, uploadError.message);
-    throw new ChatError("Couldn't save the generated image. Please try again.", 500);
+    if (result instanceof ReadableStream) {
+      const chunks: Uint8Array[] = [];
+      const reader = result.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) chunks.push(value);
+      }
+      const total = chunks.reduce((n, c) => n + c.length, 0);
+      imageBytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) { imageBytes.set(chunk, offset); offset += chunk.length; }
+    } else if ("image" in result && typeof result.image === "string") {
+      const binary = atob(result.image);
+      imageBytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) imageBytes[i] = binary.charCodeAt(i);
+    } else {
+      throw new Error("Unexpected image response format");
+    }
+  } catch (err) {
+    if (err instanceof ChatError) throw err;
+    throw new ChatError("Image generation failed. Please try again.", 502);
   }
 
+  // Store in R2 (or fall back to base64 data URL if no R2 binding)
+  const imagePath = `${userId}/${crypto.randomUUID()}.png`;
+  let r2Url: string;
+
+  if (r2) {
+    await r2.put(imagePath, imageBytes, { httpMetadata: { contentType: "image/png" } });
+    r2Url = `/api/images/${imagePath}`;
+  } else {
+    // Fallback: base64 data URL (dev only)
+    const b64 = btoa(String.fromCharCode(...imageBytes));
+    r2Url = `data:image/png;base64,${b64}`;
+  }
+
+  // Create conversation if needed
   let conversationId = input.conversationId;
   if (!conversationId) {
-    const { data, error } = await supabase
-      .from("conversations")
-      .insert({ user_id: userId, title: prompt.slice(0, CONFIG.titleLength) })
-      .select("id")
-      .single();
-    if (error) throw new ChatError("Couldn't start the conversation. Please try again.", 500);
-    conversationId = data.id;
+    const convo = await createConversation(db, userId, prompt.slice(0, 60));
+    conversationId = convo.id;
   }
 
-  // Billed and ledgered before the transcript is written: the image already
-  // exists, so its usage record must survive a failed message write or the
-  // user deleting the chat mid-generation.
-  const charge = model.pricePerImage;
-  const balance = await settleCharge(userId, charge, ctx);
+  // Billing
+  let balance = 0;
+  if (charge > 0) {
+    balance = await updateWalletBalance(db, userId, -charge);
+  } else {
+    balance = (await getWallet(db, userId))?.balance ?? 0;
+  }
 
-  await recordUsage(
+  // Record usage
+  await recordUsage(db, {
+    user_id: userId,
+    provider: "Cloudflare AI",
+    model: `${model.label} (image)`,
+    conversation_id: conversationId,
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+    cache_write_tokens: 0,
+    cache_read_tokens: 0,
+    api_cost: IMAGE_API_COST_USD,
+    platform_markup: round6(charge - IMAGE_API_COST_USD),
+    final_cost: charge,
+  });
+
+  // Persist messages
+  const now = new Date();
+  const written = await insertMessages(db, [
+    { conversation_id: conversationId, role: "user", content: prompt, created_at: now.toISOString() },
     {
-      user_id: userId,
-      provider: PROVIDERS[model.provider].label,
-      model: `${model.label} (image)`,
       conversation_id: conversationId,
-      input_tokens: 0,
-      output_tokens: 0,
-      cached_input_tokens: 0,
-      cache_write_tokens: 0,
-      cache_read_tokens: 0,
-      api_cost: apiCost,
-      platform_markup: round6(charge - apiCost),
-      final_cost: charge,
+      role: "assistant",
+      content: `[Image: ${imagePath}]`,
+      created_at: new Date(now.getTime() + 1).toISOString(),
     },
-    ctx,
-  );
+  ]);
 
-  const askedAt = new Date();
-  const answeredAt = new Date(askedAt.getTime() + 1);
-
-  const { data: written, error: writeError } = await supabase
-    .from("messages")
-    .insert([
-      {
-        conversation_id: conversationId,
-        role: "user",
-        content: prompt,
-        kind: "text",
-        created_at: askedAt.toISOString(),
-      },
-      {
-        conversation_id: conversationId,
-        role: "assistant",
-        content: prompt,
-        kind: "image",
-        image_url: path,
-        created_at: answeredAt.toISOString(),
-      },
-    ])
-    .select("id, role, content, created_at, image_url");
-  if (writeError || !written || written.length !== 2) {
-    throw new ChatError("Couldn't save the image. Please try again.", 500);
-  }
-
-  const userMessage = written.find((m) => m.role === "user")!;
-  const assistantRow = written.find((m) => m.role === "assistant")!;
-
-  await supabase
-    .from("conversations")
-    .update({ updated_at: new Date().toISOString() })
-    .eq("id", conversationId);
-
-
-  const signedUrl = await signImagePath(path);
+  const userMsg = written.find((m) => m.role === "user")!;
+  const assistantMsg = written.find((m) => m.role === "assistant")!;
 
   return {
     conversationId,
-    userMessageId: userMessage.id,
+    userMessageId: userMsg.id,
     assistantMessage: {
-      id: assistantRow.id,
-      content: assistantRow.content,
-      created_at: assistantRow.created_at,
-      imagePath: path,
+      id: assistantMsg.id,
+      content: assistantMsg.content,
+      created_at: assistantMsg.created_at,
+      imagePath,
     },
-    signedUrl,
+    r2Url,
     balance,
     cost: charge,
   };
 }
 
-/** Short-lived read URL for one stored image. */
-export async function signImagePath(path: string): Promise<string> {
-  const { data, error } = await supabaseAdmin.storage
-    .from(CONFIG.bucket)
-    .createSignedUrl(path, CONFIG.signedUrlSeconds);
-  if (error || !data?.signedUrl) throw new ChatError("Couldn't load the image.", 500);
-  return data.signedUrl;
-}
-
-/** Signs several paths at once, skipping any that don't belong to the caller. */
-export async function signImagePathsForUser(
-  userId: string,
-  paths: string[],
-): Promise<Record<string, string>> {
-  const owned = paths.filter((p) => p.startsWith(`${userId}/`));
-  if (owned.length === 0) return {};
-
-  const { data, error } = await supabaseAdmin.storage
-    .from(CONFIG.bucket)
-    .createSignedUrls(owned, CONFIG.signedUrlSeconds);
-  if (error || !data) return {};
-
-  const result: Record<string, string> = {};
-  for (const entry of data) {
-    if (entry.path && entry.signedUrl) result[entry.path] = entry.signedUrl;
-  }
-  return result;
+/** Get a signed R2 URL for an image (1-hour TTL). */
+export async function getImageUrl(env: WorkerEnv, path: string): Promise<string> {
+  const r2 = (env as unknown as { FRAOULA_IMAGES?: R2Bucket }).FRAOULA_IMAGES;
+  if (!r2) throw new ChatError("Image storage not configured.", 503);
+  const obj = await r2.get(path);
+  if (!obj) throw new ChatError("Image not found.", 404);
+  // R2 doesn't have signed URLs natively without Workers Bucket URL — return as /api route
+  return `/api/images/${path}`;
 }

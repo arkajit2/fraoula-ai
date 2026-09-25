@@ -2,13 +2,12 @@
  * SERVER-ONLY provider abstraction.
  *
  * The rest of the application asks for "a completion from a model" and never
- * learns which upstream served it. Adding a provider means adding an entry to
- * PROVIDERS in pricing.server.ts plus (if its wire format differs) a branch in
- * `callModel` — no other layer changes, and the UI never changes at all.
+ * learns which upstream served it. Cloudflare Workers AI is called via the
+ * Worker binding (`ai`) that is passed into `callModel` — no API keys, no HTTP
+ * fetch, no gateway endpoints required.
  */
 
 import type { ModelConfig } from "./pricing";
-import { PROVIDERS } from "./pricing.server";
 
 export interface ProviderMessage {
   role: "system" | "user" | "assistant";
@@ -39,94 +38,63 @@ export class ProviderError extends Error {
   }
 }
 
-const REQUEST_TIMEOUT_MS = 120_000;
-
-interface OpenAiCompatibleResponse {
-  choices?: { message?: { content?: string } }[];
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    prompt_tokens_details?: { cached_tokens?: number };
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-  };
+/**
+ * Minimal interface for the Cloudflare Workers AI binding.
+ * The actual `Ai` type from `@cloudflare/workers-types` is a superset of this.
+ */
+interface CfAiBinding {
+  run(
+    model: string,
+    inputs: { messages: Array<{ role: string; content: string }> },
+  ): Promise<{ response?: string; [key: string]: unknown }>;
 }
 
 /**
- * Calls the upstream for `model`. Never deducts, never persists — billing is
- * the caller's job and only happens once real token counts come back.
+ * Calls the Cloudflare Workers AI binding for `model`. Never deducts, never
+ * persists — billing is the caller's job and only happens once real token
+ * counts come back.
+ *
+ * Token counts are estimated (~4 chars per token) because the CF AI binding
+ * does not currently return usage metadata.
  */
 export async function callModel(
   model: ModelConfig,
   messages: ProviderMessage[],
+  ai: CfAiBinding,
 ): Promise<ProviderCompletion> {
-  const provider = PROVIDERS[model.provider];
-  if (!provider?.enabled) throw new ProviderError("That model isn't available right now.", 503);
+  const start = Date.now();
 
-  const apiKey = process.env[provider.apiKeyEnv];
-  if (!apiKey) {
-    throw new ProviderError(
-      "That model isn't available right now.",
-      503,
-      `missing env ${provider.apiKeyEnv}`,
-    );
-  }
-
-  const body: Record<string, unknown> = { model: model.remoteModel, messages };
-  if (model.remoteModel.startsWith("openai/gpt-5.6")) body.reasoning_effort = "none";
-
-  const startedAt = Date.now();
-  let response: Response;
+  let result: { response?: string; [key: string]: unknown };
   try {
-    response = await fetch(provider.endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    result = await ai.run(model.remoteModel, { messages });
   } catch (error) {
     throw new ProviderError(
       "The model didn't respond in time. Please try again.",
       504,
-      error instanceof Error ? error.message : "network error",
+      error instanceof Error ? error.message : "CF AI binding error",
     );
   }
 
-  const latencyMs = Date.now() - startedAt;
+  const latencyMs = Date.now() - start;
 
-  if (response.status === 429) {
-    throw new ProviderError("The model is busy right now. Please try again in a moment.", 429);
-  }
-  if (response.status === 402) {
-    throw new ProviderError("AI service credits are exhausted. Please contact support.", 402);
-  }
-  if (!response.ok) {
-    throw new ProviderError(
-      "The model couldn't complete your request. Please try again.",
-      502,
-      `upstream ${response.status}: ${(await response.text()).slice(0, 500)}`,
-    );
-  }
-
-  let json: OpenAiCompatibleResponse;
-  try {
-    json = (await response.json()) as OpenAiCompatibleResponse;
-  } catch {
-    throw new ProviderError("The model returned an unreadable response. Please try again.", 502);
-  }
-
-  const content = json.choices?.[0]?.message?.content?.trim();
+  const content = typeof result.response === "string" ? result.response.trim() : "";
   if (!content) {
     throw new ProviderError("The model returned an empty response. Please try again.", 502);
   }
 
+  // Estimate token counts: ~4 characters per token (CF AI does not expose usage).
+  const inputTokens = Math.ceil(
+    messages.reduce((acc, m) => acc + m.content.length, 0) / 4,
+  );
+  const outputTokens = Math.ceil(content.length / 4);
+
   return {
     content,
-    inputTokens: Math.max(0, json.usage?.prompt_tokens ?? 0),
-    outputTokens: Math.max(0, json.usage?.completion_tokens ?? 0),
-    cachedInputTokens: Math.max(0, json.usage?.prompt_tokens_details?.cached_tokens ?? 0),
-    cacheWriteTokens: Math.max(0, json.usage?.cache_creation_input_tokens ?? 0),
-    cacheReadTokens: Math.max(0, json.usage?.cache_read_input_tokens ?? 0),
+    inputTokens,
+    outputTokens,
+    cachedInputTokens: 0,
+    cacheWriteTokens: 0,
+    cacheReadTokens: 0,
     latencyMs,
   };
 }

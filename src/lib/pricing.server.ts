@@ -1,96 +1,48 @@
 /**
  * SERVER-ONLY pricing configuration.
  *
- * Provider API costs and endpoints. Never import this from client code —
- * customers must never see raw provider pricing or key names.
+ * Internal Cloudflare Workers AI costs and billing helpers. Never import this
+ * from client code — customers must never see raw provider pricing.
+ *
+ * All costs are USD per 1,000,000 tokens. Customer rates (2x) live in
+ * `pricing.ts`; only the raw CF costs are tracked here for margin reporting.
  */
 
-import {
-  getModel,
-  priceUsage,
-  round6,
-  type CustomerRates,
-  type ModelConfig,
-  type ProviderId,
-  type TokenUsage,
-} from "./pricing";
+import type { ModelConfig, TokenUsage } from "./pricing";
+import { priceUsage, round6, per1M } from "./pricing";
 
-export interface ProviderConfig {
-  id: ProviderId;
-  label: string;
-  endpoint: string;
-  apiKeyEnv: string;
-  enabled: boolean;
-}
-
-/** All enabled models currently route through the managed AI gateway. */
-const GATEWAY_ENDPOINT = "https://ai.gateway.lovable.dev/v1/chat/completions";
-
-export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
-  google: { id: "google", label: "Google", endpoint: GATEWAY_ENDPOINT, apiKeyEnv: "LOVABLE_API_KEY", enabled: true },
-  openai: { id: "openai", label: "OpenAI", endpoint: GATEWAY_ENDPOINT, apiKeyEnv: "LOVABLE_API_KEY", enabled: true },
-  anthropic: {
-    id: "anthropic",
-    label: "Anthropic",
-    endpoint: "https://api.anthropic.com/v1/messages",
-    apiKeyEnv: "ANTHROPIC_API_KEY",
-    enabled: false,
+export const PROVIDERS = {
+  cloudflare: {
+    label: "Cloudflare AI",
+    enabled: true,
+    /** Internal CF AI costs (USD per 1M tokens) — for cost tracking only. */
+    costs: {
+      "llama-3-1-8b":      { input: 0,    output: 0    },
+      "llama-3-2-3b":      { input: 0,    output: 0    },
+      "llama-3-3-70b":     { input: 0.50, output: 1.50 },
+      "deepseek-v4-flash": { input: 0.50, output: 1.50 },
+      "gpt-oss-20b":       { input: 2.00, output: 6.00 },
+      "deepseek-r1-32b":   { input: 2.00, output: 6.00 },
+      "qwq-32b":           { input: 2.00, output: 6.00 },
+      "deepseek-v4-pro":   { input: 5.00, output: 15.00 },
+      "gpt-oss-120b":      { input: 5.00, output: 15.00 },
+      "kimi-k2":           { input: 3.00, output: 9.00 },
+      "nvidia-nemotron":   { input: 5.00, output: 15.00 },
+      "llama-4-scout":     { input: 1.00, output: 3.00 },
+    } as Record<string, { input: number; output: number }>,
   },
-  fable: {
-    id: "fable",
-    label: "Fable",
-    endpoint: GATEWAY_ENDPOINT,
-    apiKeyEnv: "LOVABLE_API_KEY",
-    enabled: false,
-  },
-};
+} as const;
 
-/** Provider API cost, USD per 1M tokens. Customer pricing is exactly 2x these. */
-export const API_RATES: Record<string, CustomerRates> = {
-  "gemini-3-6-flash": { input: 1.5, output: 7.5 },
-  "gpt-5-6-luna": { input: 1, output: 6, cachedInput: 0.1 },
-  "gpt-5-6-terra": { input: 2.5, output: 15, cachedInput: 0.25 },
-  "opus-5": { input: 5, output: 25 },
-  "fable-5": { input: 10, output: 50, cacheWrite: 12.5, cacheRead: 1 },
-};
-
-/** Provider cost for one generated image, USD. Customers pay exactly 2x these. */
-export const IMAGE_API_COSTS: Record<string, number> = {
-  "nano-banana-2": 0.01,
-  "gpt-image-2": 0.02,
-  "gemini-3-pro-image": 0.06,
-};
-
-/** Endpoint used for image generation on the managed AI gateway. */
-export const IMAGE_ENDPOINT = "https://ai.gateway.lovable.dev/v1/images/generations";
-
-
-export interface BillingBreakdown {
-  /** What the provider charges us. */
-  apiCost: number;
-  /** Platform margin (customer charge - api cost). */
-  platformMarkup: number;
-  /** What the customer is charged. */
-  customerCharge: number;
-}
-
-/** Generic: works for any model in the config, no per-model branching. */
-export function computeBilling(model: ModelConfig, usage: TokenUsage): BillingBreakdown {
-  if (model.free) return { apiCost: 0, platformMarkup: 0, customerCharge: 0 };
-
-  const apiRates = API_RATES[model.id];
-  const apiCost = apiRates ? priceUsage(apiRates, usage) : 0;
-  const customerCharge = priceUsage(model.rates, usage);
-
-  return {
-    apiCost: round6(apiCost),
-    platformMarkup: round6(customerCharge - apiCost),
-    customerCharge: round6(customerCharge),
-  };
-}
-
-export function getRoutableModel(id: string): ModelConfig | undefined {
-  const model = getModel(id);
-  if (!model || !model.enabled) return undefined;
-  return PROVIDERS[model.provider].enabled ? model : undefined;
+export function computeBilling(
+  model: ModelConfig,
+  usage: TokenUsage,
+): { apiCost: number; platformMarkup: number; customerCharge: number } {
+  const providerCosts = PROVIDERS.cloudflare.costs[model.id] ?? { input: 0, output: 0 };
+  const apiCost = round6(
+    per1M(usage.inputTokens ?? 0, providerCosts.input) +
+    per1M(usage.outputTokens ?? 0, providerCosts.output),
+  );
+  const customerCharge = model.free ? 0 : round6(priceUsage(model.rates, usage));
+  const platformMarkup = round6(customerCharge - apiCost);
+  return { apiCost, platformMarkup, customerCharge };
 }

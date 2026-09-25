@@ -9,13 +9,10 @@
  * no billing logic needs to change.
  */
 
-export type ProviderId = "google" | "openai" | "anthropic" | "fable";
+export type ProviderId = "cloudflare";
 
 export const PROVIDER_LABELS: Record<ProviderId, string> = {
-  google: "Google",
-  openai: "OpenAI",
-  anthropic: "Anthropic",
-  fable: "Fable",
+  cloudflare: "Cloudflare AI",
 };
 
 export interface CustomerRates {
@@ -35,7 +32,7 @@ export interface ModelConfig {
   id: string;
   label: string;
   provider: ProviderId;
-  /** Identifier sent to the AI gateway. */
+  /** Identifier sent to the Cloudflare Workers AI binding. */
   remoteModel: string;
   /** What the customer pays (2x the provider API cost). */
   rates: CustomerRates;
@@ -48,68 +45,122 @@ export interface ModelConfig {
 }
 
 export const MODELS: ModelConfig[] = [
+  // ── Free models ─────────────────────────────────────────────────────────────
   {
-    id: "gemini-2-5-flash-lite",
-    label: "Gemini 2.5 Flash Lite",
-    provider: "google",
-    remoteModel: "google/gemini-2.5-flash-lite",
+    id: "llama-3-1-8b",
+    label: "Llama 3.1 8B",
+    provider: "cloudflare",
+    remoteModel: "@cf/meta/llama-3.1-8b-instruct-fp8",
     rates: { input: 0, output: 0 },
     free: true,
     enabled: true,
   },
   {
+    id: "llama-3-2-3b",
+    label: "Llama 3.2 3B",
+    provider: "cloudflare",
+    remoteModel: "@cf/meta/llama-3.2-3b-instruct",
+    rates: { input: 0, output: 0 },
+    free: true,
+    enabled: true,
+  },
 
-    id: "gemini-3-6-flash",
-    label: "Gemini 3.6 Flash",
-    provider: "google",
-    remoteModel: "google/gemini-3.6-flash",
-    rates: { input: 3, output: 15 },
+  // ── Paid models ──────────────────────────────────────────────────────────────
+  {
+    id: "llama-3-3-70b",
+    label: "Llama 3.3 70B (Fast)",
+    provider: "cloudflare",
+    remoteModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    rates: { input: 1.00, output: 3.00 },
     free: false,
     enabled: true,
   },
   {
-    id: "gpt-5-6-luna",
-    label: "GPT-5.6 Luna",
-    provider: "openai",
-    remoteModel: "openai/gpt-5.6-luna",
-    rates: { input: 2, output: 12, cachedInput: 0.2 },
+    id: "deepseek-v4-flash",
+    label: "DeepSeek V4 Flash",
+    provider: "cloudflare",
+    remoteModel: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+    rates: { input: 1.00, output: 3.00 },
     free: false,
     enabled: true,
   },
   {
-    id: "gpt-5-6-terra",
-    label: "GPT-5.6 Terra",
-    provider: "openai",
-    remoteModel: "openai/gpt-5.6-terra",
-    rates: { input: 5, output: 30, cachedInput: 0.5 },
+    id: "gpt-oss-20b",
+    label: "GPT OSS 20B",
+    provider: "cloudflare",
+    remoteModel: "@cf/openai/gpt-oss-20b",
+    rates: { input: 4.00, output: 12.00 },
     free: false,
     enabled: true,
   },
   {
-    id: "opus-5",
-    label: "Opus 5",
-    provider: "anthropic",
-    remoteModel: "opus-5",
-    rates: { input: 10, output: 50 },
+    id: "deepseek-r1-32b",
+    label: "DeepSeek R1 32B",
+    provider: "cloudflare",
+    remoteModel: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+    rates: { input: 4.00, output: 12.00 },
     free: false,
-    enabled: false,
-    note: "Not yet available on the AI gateway",
+    enabled: true,
   },
   {
-    id: "fable-5",
-    label: "Fable 5",
-    provider: "fable",
-    remoteModel: "fable-5",
-    rates: { input: 20, output: 100, cacheWrite: 25, cacheRead: 2 },
+    id: "qwq-32b",
+    label: "QwQ 32B (Reasoning)",
+    provider: "cloudflare",
+    remoteModel: "@cf/qwen/qwq-32b",
+    rates: { input: 4.00, output: 12.00 },
     free: false,
-    enabled: false,
-    note: "Not yet available on the AI gateway",
+    enabled: true,
+  },
+  {
+    id: "llama-4-scout",
+    label: "Llama 4 Scout 17B",
+    provider: "cloudflare",
+    remoteModel: "@cf/meta/llama-4-scout-17b-16e-instruct",
+    rates: { input: 2.00, output: 6.00 },
+    free: false,
+    enabled: true,
+  },
+  {
+    id: "kimi-k2",
+    label: "Kimi K2.7 Code",
+    provider: "cloudflare",
+    remoteModel: "@cf/moonshotai/kimi-k2.7-code",
+    rates: { input: 6.00, output: 18.00 },
+    free: false,
+    enabled: true,
+  },
+  {
+    id: "deepseek-v4-pro",
+    label: "DeepSeek V4 Pro",
+    provider: "cloudflare",
+    remoteModel: "@cf/deepseek-ai/deepseek-v4-pro-0813",
+    rates: { input: 10.00, output: 30.00 },
+    free: false,
+    enabled: true,
+  },
+  {
+    id: "gpt-oss-120b",
+    label: "GPT OSS 120B",
+    provider: "cloudflare",
+    remoteModel: "@cf/openai/gpt-oss-120b",
+    rates: { input: 10.00, output: 30.00 },
+    free: false,
+    enabled: true,
+  },
+  {
+    id: "nvidia-nemotron",
+    label: "Nvidia Nemotron 120B",
+    provider: "cloudflare",
+    remoteModel: "@cf/nvidia/nemotron-3-120b-a12b",
+    rates: { input: 10.00, output: 30.00 },
+    free: false,
+    enabled: true,
   },
 ];
 
 export const AVAILABLE_MODELS = MODELS.filter((m) => m.enabled);
 
-export const DEFAULT_MODEL_ID = "gemini-2-5-flash-lite";
+export const DEFAULT_MODEL_ID = "llama-3-1-8b";
 
 /**
  * Image generation is billed per image rather than per token, but follows the
@@ -130,47 +181,17 @@ export interface ImageModelConfig {
   pricePerImage: number;
 }
 
-export const IMAGE_MODELS: ImageModelConfig[] = [
-  {
-    id: "nano-banana-2",
-    label: "Nano Banana 2",
-    description: "Fastest and most affordable",
-    provider: "google",
-    remoteModel: "google/gemini-3.1-flash-image",
-    wire: "gemini",
-    pricePerImage: 0.02,
-  },
-  {
-    id: "gpt-image-2",
-    label: "GPT Image 2",
-    description: "Balanced quality and speed",
-    provider: "openai",
-    remoteModel: "openai/gpt-image-2",
-    wire: "openai",
-    size: "1024x1024",
-    quality: "low",
-    pricePerImage: 0.04,
-  },
-  {
-    id: "gemini-3-pro-image",
-    label: "Gemini 3 Pro Image",
-    description: "Highest detail and fidelity",
-    provider: "google",
-    remoteModel: "google/gemini-3-pro-image",
-    wire: "gemini",
-    pricePerImage: 0.12,
-  },
-];
+export const IMAGE_MODELS: ImageModelConfig[] = [];
 
-export const DEFAULT_IMAGE_MODEL_ID = "gpt-image-2";
+export const DEFAULT_IMAGE_MODEL_ID = "";
 
 export function getImageModel(id: string): ImageModelConfig | undefined {
   return IMAGE_MODELS.find((m) => m.id === id);
 }
 
 /** Cheapest image, used as the minimum balance gate before generating. */
-export const MIN_IMAGE_PRICE = Math.min(...IMAGE_MODELS.map((m) => m.pricePerImage));
-
+export const MIN_IMAGE_PRICE =
+  IMAGE_MODELS.length > 0 ? Math.min(...IMAGE_MODELS.map((m) => m.pricePerImage)) : 0;
 
 
 export function getModel(id: string): ModelConfig | undefined {
@@ -375,11 +396,14 @@ export function getPlanByPriceId(priceId: string): PlanConfig | undefined {
 /**
  * Minimum plan tier required for a model. Anything not listed is available to
  * everyone on pay-as-you-go credits, so adding a model stays a config change.
+ *
+ * tier 1 = Plus plan, tier 2 = Pro plan
  */
 export const MODEL_MIN_TIER: Record<string, number> = {
-  "gpt-5-6-terra": 1,
-  "opus-5": 2,
-  "fable-5": 2,
+  "deepseek-v4-pro": 1,
+  "kimi-k2": 1,
+  "gpt-oss-120b": 2,
+  "nvidia-nemotron": 2,
 };
 
 export function modelMinTier(modelId: string): number {

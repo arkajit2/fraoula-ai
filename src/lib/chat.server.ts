@@ -1,66 +1,78 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
-import type { Database } from "@/integrations/supabase/types";
-import { supabaseAdmin } from "@/integrations/supabase/client.server";
+/**
+ * Chat server — Cloudflare D1 + Workers AI edition.
+ *
+ * Replaces the Supabase-backed version. All DB access goes through D1,
+ * all AI calls go through the Workers AI binding (env.AI). No external
+ * API keys required; auth is now JWT-based via auth.server.ts.
+ */
+
+import type { ModelConfig, TokenUsage } from "./pricing";
 import {
-  INSUFFICIENT_BALANCE_MESSAGE,
-  PLAN_REQUIRED_MESSAGE,
-  canUseModel,
+  computeCustomerCharge,
+  getModel,
   modelMinTier,
-  type TokenUsage,
+  canUseModel,
+  PLAN_REQUIRED_MESSAGE,
+  INSUFFICIENT_BALANCE_MESSAGE,
+  FREE_LIMIT_MESSAGE,
+  RATE_LIMIT_MESSAGE,
+  round6,
 } from "./pricing";
-import { FreeTierError, assertFreeAllowance, recordFreeUsage } from "./free-tier.server";
-import { PROVIDERS, computeBilling, getRoutableModel } from "./pricing.server";
-import { ProviderError, callModel, type ProviderMessage } from "./providers.server";
-import { enforceRateLimit } from "./rate-limit.server";
-import { log } from "./logging.server";
-import { recordUsage } from "./usage.server";
+import { computeBilling } from "./pricing.server";
+import { callModel, ProviderError } from "./providers.server";
+import type { CfAiBinding } from "./providers.server";
+import {
+  getWallet,
+  createWallet,
+  updateWalletBalance,
+  getConversation,
+  createConversation,
+  getMessages,
+  insertMessages,
+  recordUsage,
+  getFreeUsageToday,
+  incrementFreeUsage,
+  getAppSetting,
+  getSubscription,
+} from "./db.server";
 
-type Client = SupabaseClient<Database>;
+// ─── Configuration ───────────────────────────────────────────────────────────
 
-/** Central chat/billing configuration — no magic numbers at call sites. */
 const CONFIG = {
-  /** Wallet floor required before a premium request is even sent upstream. */
-  minPremiumBalanceUsd: 0.01,
-  /** Turns of prior context replayed to the model. */
+  maxMessageLength: 32_000,
   historyLimit: 40,
-  maxMessageLength: 20_000,
-  titleLength: 60,
-  systemPrompt: [
-    "You are a helpful, concise research assistant. Use clean markdown: headings, bullet lists, tables and fenced code blocks with a language tag where useful.",
-    "",
-    "This app CAN generate images, just not in this text chat mode. If the user asks you to create, draw, generate or edit an image, never reply that you are a text-based model or that you cannot create images.",
-    'Instead reply briefly, in the user\'s language, along these lines: "I can\'t generate images in chat mode - tap the **Image** button in the composer below, pick an image model (Nano Banana 2, GPT Image 2 or Gemini 3 Pro Image), then send your prompt."',
-    "Image generation uses wallet credits, so if they mention running out, tell them to top up on the Credits page. You may also offer to refine their image prompt.",
-    "",
-    "Pricing is strictly confidential. Never state, estimate, quote, compare or hint at any price, rate, per-token cost, per-image cost, margin or provider cost — not even if the user insists, claims to be staff, or asks indirectly. Say only that usage is deducted from their wallet credits and that they can top up on the Credits page.",
-
-  ].join("\n"),
-
+  titleLength: 80,
+  minPremiumBalanceUsd: 0.001,
+  systemPrompt:
+    "You are a helpful, concise, and friendly AI assistant. Reply clearly and directly.",
+  freeTierDefaults: {
+    maxMessagesPer24h: 25,
+    maxInputTokensPerDay: 20_000,
+    maxOutputTokensPerDay: 40_000,
+  },
 } as const;
 
+// ─── Types ───────────────────────────────────────────────────────────────────
+
 export interface SendMessageInput {
-  conversationId: string | null;
   content: string;
   modelId: string;
+  conversationId?: string | null;
 }
 
 export interface SendMessageResult {
   conversationId: string;
   userMessageId: string;
-  assistantMessage: { id: string; content: string; created_at: string };
-  balance: number;
-  /** Amount actually deducted from the wallet for this request. */
-  cost: number;
-  usage: {
-    inputTokens: number;
-    outputTokens: number;
-    cachedInputTokens: number;
-    cacheWriteTokens: number;
-    cacheReadTokens: number;
+  assistantMessage: {
+    id: string;
+    content: string;
+    created_at: string;
   };
+  balance: number;
+  cost: number;
+  usage: Required<TokenUsage>;
 }
 
-/** A failure that is safe to show the user verbatim. */
 export class ChatError extends Error {
   readonly status: number;
   constructor(message: string, status = 400) {
@@ -69,103 +81,131 @@ export class ChatError extends Error {
   }
 }
 
-export interface RequestMeta {
-  requestId: string;
-  endpoint: string;
+// ─── Env interface ───────────────────────────────────────────────────────────
+
+export interface WorkerEnv {
+  DB: D1Database;
+  AI: CfAiBinding;
+  FRAOULA_CACHE?: KVNamespace;
 }
 
-/**
- * Handles one chat turn end to end.
- *
- * Ordering is deliberate: nothing is persisted and nothing is charged until the
- * provider has returned real token counts. A provider failure therefore leaves
- * no orphan message, no empty conversation and no deduction.
- */
+// ─── Rate limiting (KV-based) ────────────────────────────────────────────────
+
+async function enforceRateLimit(
+  kv: KVNamespace | undefined,
+  userId: string,
+  key: string,
+  limit: number,
+  windowSecs: number,
+): Promise<void> {
+  if (!kv) return; // skip in dev
+  const kvKey = `rl:${key}:${userId}`;
+  const raw = await kv.get(kvKey);
+  const count = raw ? parseInt(raw, 10) : 0;
+  if (count >= limit) {
+    throw new ChatError(RATE_LIMIT_MESSAGE, 429);
+  }
+  await kv.put(kvKey, String(count + 1), { expirationTtl: windowSecs });
+}
+
+// ─── Free tier enforcement ───────────────────────────────────────────────────
+
+async function assertFreeAllowance(
+  db: D1Database,
+  userId: string,
+): Promise<void> {
+  // Load live limits from app_settings (falls back to defaults)
+  let limits = CONFIG.freeTierDefaults;
+  try {
+    const raw = await getAppSetting(db, "free_tier_limits");
+    if (raw) limits = { ...limits, ...JSON.parse(raw) };
+  } catch {
+    /* use defaults */
+  }
+
+  const today = await getFreeUsageToday(db, userId);
+  if (today && today.messages_count >= limits.maxMessagesPer24h) {
+    throw new ChatError(FREE_LIMIT_MESSAGE, 429);
+  }
+  if (today && today.input_tokens >= limits.maxInputTokensPerDay) {
+    throw new ChatError(FREE_LIMIT_MESSAGE, 429);
+  }
+}
+
+// ─── Main send function ───────────────────────────────────────────────────────
+
 export async function sendMessage(
-  supabase: Client,
+  env: WorkerEnv,
   userId: string,
   input: SendMessageInput,
-  meta: RequestMeta,
 ): Promise<SendMessageResult> {
-  const ctx = { ...meta, userId };
+  const { DB: db, AI: ai, FRAOULA_CACHE: kv } = env;
 
   const content = input.content.trim();
   if (!content) throw new ChatError("Message cannot be empty.");
-  if (content.length > CONFIG.maxMessageLength) throw new ChatError("Message is too long.");
+  if (content.length > CONFIG.maxMessageLength)
+    throw new ChatError("Message is too long.");
 
-  const model = getRoutableModel(input.modelId);
-  if (!model) throw new ChatError("That model isn't available right now.");
+  const model = getModel(input.modelId);
+  if (!model || !model.enabled)
+    throw new ChatError("That model isn't available right now.");
 
-  await enforceRateLimit(userId, "chatBurst");
-  await enforceRateLimit(userId, "chat");
+  // Rate limits: burst (10/min) and sustained (60/hr)
+  await enforceRateLimit(kv, userId, "burst", 10, 60);
+  await enforceRateLimit(kv, userId, "sustained", 60, 3600);
 
-  // --- ownership -----------------------------------------------------------
-  // RLS already scopes this client to the caller; the explicit check turns a
-  // silent empty result into a clear authorisation failure.
+  // ── Ownership check ────────────────────────────────────────────────────────
   if (input.conversationId) {
-    const { data: owned } = await supabase
-      .from("conversations")
-      .select("id")
-      .eq("id", input.conversationId)
-      .maybeSingle();
-    if (!owned) throw new ChatError("Conversation not found.", 404);
+    const convo = await getConversation(db, input.conversationId, userId);
+    if (!convo) throw new ChatError("Conversation not found.", 404);
   }
 
-  // --- entitlement (server-side only) --------------------------------------
+  // ── Plan / entitlement ────────────────────────────────────────────────────
   if (modelMinTier(model.id) > 0) {
-    const { getActivePlanId } = await import("./subscriptions.server");
-    if (!canUseModel(model.id, await getActivePlanId(userId))) {
+    const sub = await getSubscription(db, userId);
+    if (!canUseModel(model.id, sub?.plan_id)) {
       throw new ChatError(PLAN_REQUIRED_MESSAGE, 402);
     }
   }
 
+  // ── Balance / allowance check ─────────────────────────────────────────────
   if (model.free) {
-    try {
-      await assertFreeAllowance(userId);
-    } catch (error) {
-      if (error instanceof FreeTierError) throw new ChatError(error.message, 429);
-      throw error;
-    }
+    await assertFreeAllowance(db, userId);
   } else {
-    const { data: wallet } = await supabaseAdmin
-      .from("wallets")
-      .select("balance")
-      .eq("user_id", userId)
-      .maybeSingle();
-    if (!wallet || Number(wallet.balance) < CONFIG.minPremiumBalanceUsd) {
+    let wallet = await getWallet(db, userId);
+    if (!wallet) wallet = await createWallet(db, userId);
+    if (wallet.balance < CONFIG.minPremiumBalanceUsd) {
       throw new ChatError(INSUFFICIENT_BALANCE_MESSAGE, 402);
     }
   }
 
-  // --- context -------------------------------------------------------------
-  const history: ProviderMessage[] = [];
+  // ── Conversation history ──────────────────────────────────────────────────
+  const history: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
   if (input.conversationId) {
-    const { data, error } = await supabase
-      .from("messages")
-      .select("role, content")
-      .eq("conversation_id", input.conversationId)
-      .order("created_at", { ascending: true })
-      .limit(CONFIG.historyLimit);
-    if (error) throw new ChatError("Couldn't load this conversation. Please try again.", 500);
-    for (const m of data ?? []) history.push({ role: m.role as "user" | "assistant", content: m.content });
+    const rows = await getMessages(db, input.conversationId, CONFIG.historyLimit);
+    for (const m of rows) {
+      history.push({ role: m.role as "user" | "assistant", content: m.content });
+    }
   }
 
-  // --- provider ------------------------------------------------------------
-  let completion;
+  // ── AI call ───────────────────────────────────────────────────────────────
+  let completion: Awaited<ReturnType<typeof callModel>>;
   try {
-    completion = await callModel(model, [
-      { role: "system", content: CONFIG.systemPrompt },
-      ...history,
-      { role: "user", content },
-    ]);
+    completion = await callModel(
+      model,
+      [
+        { role: "system", content: CONFIG.systemPrompt },
+        ...history,
+        { role: "user", content },
+      ],
+      ai,
+    );
   } catch (error) {
     if (error instanceof ProviderError) {
-      log.error("provider.failure", { ...ctx, model: model.id, status: error.status }, error.detail);
       throw new ChatError(error.message, error.status);
     }
     throw error;
   }
-  log.info("provider.latency", { ...ctx, model: model.id, latencyMs: completion.latencyMs });
 
   const usage: Required<TokenUsage> = {
     inputTokens: completion.inputTokens,
@@ -174,91 +214,71 @@ export async function sendMessage(
     cacheWriteTokens: completion.cacheWriteTokens,
     cacheReadTokens: completion.cacheReadTokens,
   };
+
   const { apiCost, platformMarkup, customerCharge } = computeBilling(model, usage);
 
-  // --- persistence ---------------------------------------------------------
+  // ── Create conversation if new ────────────────────────────────────────────
   let conversationId = input.conversationId;
   if (!conversationId) {
-    const { data, error } = await supabase
-      .from("conversations")
-      .insert({ user_id: userId, title: content.slice(0, CONFIG.titleLength) })
-      .select("id")
-      .single();
-    if (error) throw new ChatError("Couldn't start the conversation. Please try again.", 500);
-    conversationId = data.id;
+    const convo = await createConversation(
+      db,
+      userId,
+      content.slice(0, CONFIG.titleLength),
+    );
+    conversationId = convo.id;
   }
 
-  // --- billing (exact, atomic, post-generation) -----------------------------
-  // Settled and ledgered BEFORE the transcript is written: the generation has
-  // already happened, so the usage record must survive a failed message write
-  // or the user deleting the chat while the answer was still streaming.
-  const balance = model.free
-    ? await settleFreeUsage(userId, usage)
-    : await settleCharge(userId, customerCharge, ctx);
+  // ── Billing settlement ────────────────────────────────────────────────────
+  let balance: number;
+  if (model.free) {
+    await incrementFreeUsage(db, userId, usage.inputTokens, usage.outputTokens);
+    const wallet = await getWallet(db, userId);
+    balance = wallet?.balance ?? 0;
+  } else {
+    balance = await deductFromWallet(db, userId, customerCharge);
+  }
 
-  await recordUsage(
-    {
-      user_id: userId,
-      provider: PROVIDERS[model.provider].label,
-      model: model.label,
-      conversation_id: conversationId,
-      input_tokens: usage.inputTokens,
-      output_tokens: usage.outputTokens,
-      cached_input_tokens: usage.cachedInputTokens,
-      cache_write_tokens: usage.cacheWriteTokens,
-      cache_read_tokens: usage.cacheReadTokens,
-      api_cost: apiCost,
-      platform_markup: platformMarkup,
-      final_cost: customerCharge,
-    },
-    ctx,
-  );
-
-  log.info("billing.charge", {
-    ...ctx,
-    model: model.id,
-    conversationId,
-    charge: customerCharge,
-    balance,
+  // ── Record usage ──────────────────────────────────────────────────────────
+  await recordUsage(db, {
+    user_id: userId,
+    provider: "Cloudflare AI",
+    model: model.label,
+    conversation_id: conversationId,
+    input_tokens: usage.inputTokens,
+    output_tokens: usage.outputTokens,
+    cached_input_tokens: usage.cachedInputTokens,
+    cache_write_tokens: usage.cacheWriteTokens,
+    cache_read_tokens: usage.cacheReadTokens,
+    api_cost: apiCost,
+    platform_markup: platformMarkup,
+    final_cost: customerCharge,
   });
 
-  // Explicit, distinct timestamps: a shared default would make the turn's
-  // ordering ambiguous when both rows land in the same statement.
-  const askedAt = new Date();
-  const answeredAt = new Date(askedAt.getTime() + 1);
+  // ── Persist messages ──────────────────────────────────────────────────────
+  const now = new Date();
+  const askedAt = now.toISOString();
+  const answeredAt = new Date(now.getTime() + 1).toISOString();
 
-  const { data: written, error: writeError } = await supabase
-    .from("messages")
-    .insert([
-      { conversation_id: conversationId, role: "user", content, created_at: askedAt.toISOString() },
-      {
-        conversation_id: conversationId,
-        role: "assistant",
-        content: completion.content,
-        created_at: answeredAt.toISOString(),
-      },
-    ])
-    .select("id, role, content, created_at");
-  if (writeError || !written || written.length !== 2) {
-    throw new ChatError("Couldn't save the reply. Please try again.", 500);
-  }
+  const written = await insertMessages(db, [
+    { conversation_id: conversationId, role: "user", content, created_at: askedAt },
+    {
+      conversation_id: conversationId,
+      role: "assistant",
+      content: completion.content,
+      created_at: answeredAt,
+    },
+  ]);
 
-  const userMessage = written.find((m) => m.role === "user")!;
-  const assistantRow = written.find((m) => m.role === "assistant")!;
-
-  await supabase
-    .from("conversations")
-    .update({ updated_at: new Date().toISOString() })
-    .eq("id", conversationId);
-
+  const userMsg = written.find((m) => m.role === "user")!;
+  const assistantMsg = written.find((m) => m.role === "assistant")!;
 
   return {
     conversationId,
-    userMessageId: userMessage.id,
+    userMessageId: userMsg.id,
     assistantMessage: {
-      id: assistantRow.id,
-      content: assistantRow.content,
-      created_at: assistantRow.created_at,
+      id: assistantMsg.id,
+      content: assistantMsg.content,
+      created_at: assistantMsg.created_at,
     },
     balance,
     cost: model.free ? 0 : customerCharge,
@@ -266,51 +286,29 @@ export async function sendMessage(
   };
 }
 
-async function settleFreeUsage(userId: string, usage: Required<TokenUsage>): Promise<number> {
-  await recordFreeUsage(userId, usage.inputTokens, usage.outputTokens);
-  const { data: wallet } = await supabaseAdmin
-    .from("wallets")
-    .select("balance")
-    .eq("user_id", userId)
-    .maybeSingle();
-  return Number(wallet?.balance ?? 0);
+// ─── Wallet deduction ─────────────────────────────────────────────────────────
+
+async function deductFromWallet(
+  db: D1Database,
+  userId: string,
+  amount: number,
+): Promise<number> {
+  let wallet = await getWallet(db, userId);
+  if (!wallet) wallet = await createWallet(db, userId);
+
+  const toDeduct = Math.min(amount, wallet.balance);
+  const newBalance = await updateWalletBalance(db, userId, -toDeduct);
+  return newBalance;
 }
 
-/**
- * Deducts the exact charge. The database refuses to go negative, so a wallet
- * drained by a concurrent request is drained to zero and flagged for review
- * instead of silently overdrawing.
- */
-export async function settleCharge(
+// ─── Charge settlement (used by Stripe webhook) ───────────────────────────────
+
+export async function creditWallet(
+  db: D1Database,
   userId: string,
-  charge: number,
-  ctx: Record<string, unknown> & { requestId: string; endpoint: string },
+  amount: number,
 ): Promise<number> {
-  const { data, error } = await supabaseAdmin.rpc("deduct_credits", {
-    _user_id: userId,
-    _cost: charge,
-  });
-
-  if (!error) {
-    log.info("wallet.update", { ...ctx, delta: -charge, balance: Number(data ?? 0) });
-    return Number(data ?? 0);
-  }
-
-  if (!error.message?.includes("INSUFFICIENT_BALANCE")) {
-    log.error("billing.failure", ctx, error.message);
-    throw new ChatError("We couldn't complete billing for this request. Please try again.", 500);
-  }
-
-  const { data: wallet } = await supabaseAdmin
-    .from("wallets")
-    .select("balance")
-    .eq("user_id", userId)
-    .maybeSingle();
-  const remaining = Number(wallet?.balance ?? 0);
-
-  if (remaining > 0) {
-    await supabaseAdmin.rpc("deduct_credits", { _user_id: userId, _cost: remaining });
-  }
-  log.warn("billing.failure", { ...ctx, charge, collected: remaining, shortfall: charge - remaining });
-  return 0;
+  let wallet = await getWallet(db, userId);
+  if (!wallet) wallet = await createWallet(db, userId);
+  return updateWalletBalance(db, userId, amount);
 }

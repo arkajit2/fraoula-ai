@@ -3,27 +3,44 @@ compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = ".output/public"
 
-# Environment variables (set the real secret values via `wrangler secret put` or the Cloudflare dashboard)
-[vars]
-SUPABASE_PROJECT_ID = "juveyamanzbqbvckgfag"
-VITE_SUPABASE_PROJECT_ID = "juveyamanzbqbvckgfag"
-VITE_SUPABASE_URL = "https://juveyamanzbqbvckgfag.supabase.co"
+# ─── Cloudflare D1 (replaces Supabase) ───────────────────────────────────────
+[[d1_databases]]
+binding = "DB"
+database_name = "fraoula-ai-db"
+database_id = "8e20bc84-873a-4920-aea4-1ed0ae37d722"
 
-# KV namespace for session / rate-limit state
-# Create with: wrangler kv namespace create fraoula-cache
-# Then replace the id below with the output
+# ─── Cloudflare Workers AI (replaces OpenAI/Anthropic/Google) ────────────────
+[ai]
+binding = "AI"
+
+# ─── KV (rate limiting + session cache) ──────────────────────────────────────
 [[kv_namespaces]]
 binding = "FRAOULA_CACHE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "464af04bbee74045a73ba57bf43d2ad6"
 
-# R2 bucket for image storage
-# Create with: wrangler r2 bucket create fraoula-images
-[[r2_buckets]]
-binding = "FRAOULA_IMAGES"
-bucket_name = "fraoula-images"
+# ─── R2 (image storage) — enable R2 in Cloudflare dashboard first ─────────────
+# [[r2_buckets]]
+# binding = "FRAOULA_IMAGES"
+# bucket_name = "fraoula-images"
 
+# ─── Public env vars (non-secret) ────────────────────────────────────────────
+[vars]
+APP_ENV = "production"
+APP_URL = "https://fraoula-ai.arkajitdas081.workers.dev"
+# JWT_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET → set via `wrangler secret put`
+
+# ─── Production environment ──────────────────────────────────────────────────
 [env.production]
 name = "fraoula-ai"
 
-[env.staging]
-name = "fraoula-ai-staging"
+[env.production.vars]
+APP_ENV = "production"
+APP_URL = "https://fraoula.co"
+
+# ─── Preview / staging environment ───────────────────────────────────────────
+[env.preview]
+name = "fraoula-ai-preview"
+
+[env.preview.vars]
+APP_ENV = "staging"
+APP_URL = "https://fraoula-ai-preview.arkajitdas081.workers.dev"
